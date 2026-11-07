@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# 运行时
+logs/
+*.log
+config.json
+agent.token
+run/
+*.pid
+
+# 测试和构建
+.pytest_cache/
+build/
+dist/
+*.spec
+
+# 本地临时
+tmp/
+*.tmp
