@@ -113,13 +113,20 @@ D:\ds植入式\
 
 验收（全部真跑，只认真实输出）：
 
-- [ ] `python -m fireloop.agent` 启动后，`python -m fireloop.cli ping` 输出 pong；
-- [ ] `python -m fireloop.cli task "测试"` 把任务送到 agent 并回显；
-- [ ] agent 没在跑时 CLI 2 秒内明确报"agent 没在跑"，退出码非 0，不挂死；
-- [ ] token 不对时 CLI 明确报错，退出码非 0；
-- [ ] 第二个 agent 实例启动被单实例锁挡住，退出码非 0；
-- [ ] 非法 JSON、超长消息、缺字段不导致 agent 崩溃；
-- [ ] 0 模型调用、不写注册表、不装服务。
+- [x] `python -m fireloop.agent` 启动后，`python -m fireloop.cli ping` 输出 pong；
+- [x] `python -m fireloop.cli task "测试"` 把任务送到 agent 并回显；
+- [x] agent 没在跑时 CLI 2 秒内明确报"agent 没在跑"，退出码非 0，不挂死；
+- [x] token 不对时 CLI 明确报错，退出码非 0；
+- [x] 第二个 agent 实例启动被单实例锁挡住，退出码非 0；
+- [x] 非法 JSON、超长消息、缺字段不导致 agent 崩溃；
+- [x] 0 模型调用、不写注册表、不装服务。
+
+**验收记录（2026-11-07，Lead 亲跑）**
+
+- 全量单测：`python -m unittest discover -s tests -v` → 82 个用例 OK（7.29s）。
+- 集成验收：`python tests/acceptance/run_m1a_acceptance.py` → 16/16 通过。
+- 关键实测：ping 0.10s / task 0.10s / 离线报错 0.08s；Ctrl+Break 优雅退出退出码 0；ping+task 连续 5 轮无偶发离线；非法 JSON 和 2 倍超长行后 agent 仍存活；日志 JSONL 含 agent_start/agent_stop，无任务原文与 token。
+- 环境：临时 FIRELOOP_HOME，默认管道 `\\.\pipe\fireloop-implant`，真实 agent/CLI 进程。
 
 ### M1b 系统身份 + 事件（下一阶段）
 
