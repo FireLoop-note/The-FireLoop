@@ -377,19 +377,32 @@ def run_final_phase(ctx) -> None:
 
     check(ctx, "10", "无残留测试进程（隔离管道已消失）", t10_no_leftover_procs)
 
-    # 11. 零模型 / 注册表调用（静态红线） --------------------------------
+    # 11. 第三方模型 SDK / 注册表调用（静态红线，随里程碑演进） ----------
     def t11_no_model_registry() -> str:
-        forbidden = ("requests", "urllib.request", "httpx", "openai", "winreg")
+        # M1 红线随里程碑演进：
+        # - 始终禁止：第三方模型 SDK（openai/requests/httpx）、注册表写入（winreg）；
+        # - M2 起只有 llm.py 允许用标准库 urllib.request 访问模型 API，其它模块不允许联网。
+        files = sorted((SRC / "fireloop").glob("*.py"))
+        forbidden_any = ("openai", "requests", "httpx", "winreg")
         hits: list[str] = []
-        for path in sorted((SRC / "fireloop").glob("*.py")):
+        for path in files:
             text = path.read_text(encoding="utf-8")
-            for word in forbidden:
+            for word in forbidden_any:
                 if word in text:
                     hits.append(f"{path.name}:{word}")
+            if path.name != "llm.py" and "urllib.request" in text:
+                hits.append(f"{path.name}:urllib.request（只有 llm.py 允许联网）")
         require(not hits, f"命中禁止引用：{hits}")
-        return f"已扫描 {len(list((SRC / 'fireloop').glob('*.py')))} 个生产模块，无模型/网络/注册表调用"
+        network_note = (
+            "llm.py 允许标准库 urllib.request（M2 模型接入）"
+            if any(path.name == "llm.py" for path in files)
+            else "无网络调用"
+        )
+        return (
+            f"已扫描 {len(files)} 个生产模块：无第三方模型 SDK、无注册表调用；{network_note}"
+        )
 
-    check(ctx, "11", "生产代码无模型 / 网络 / 注册表调用（M1a 红线）", t11_no_model_registry)
+    check(ctx, "11", "生产代码无第三方模型 SDK / 注册表调用（网络仅限 llm.py）", t11_no_model_registry)
 
     # 12. 无残留临时目录 --------------------------------------------------
     def t12_no_leftover_temp() -> str:

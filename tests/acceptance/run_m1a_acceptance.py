@@ -46,6 +46,7 @@ import harness
 import checks_b1
 import checks_b2
 import checks_m1a
+import checks_m2
 
 
 def pipeline(ctx, args) -> None:
@@ -71,6 +72,8 @@ def pipeline(ctx, args) -> None:
         checks_b2.run_cross_user_phase(ctx)
         checks_b2.run_default_config_phase(ctx)
         checks_b2.run_events_phase(ctx)
+    if "m2" in suites:
+        checks_m2.run_m2_phase(ctx, args)
 
     # 5) 清场 + 残留/红线/隔离自检（必须最后）
     checks_m1a.run_final_phase(ctx)

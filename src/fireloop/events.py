@@ -155,7 +155,8 @@ def load_config(path: str | Path | None = None) -> dict:
     """
     target = Path(path) if path is not None else config_path()
     try:
-        text = target.read_text(encoding="utf-8")
+        # utf-8-sig：容忍 BOM（PowerShell 写出的 UTF-8 文件常带 BOM）。
+        text = target.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return default_config()
     except OSError as exc:

@@ -13,11 +13,15 @@
     "<pythonw.exe>" "<项目根>\\install\\launch.py" cli file "%1"
     "<pythonw.exe>" "<项目根>\\install\\launch.py" agent
 
+结果展示器（agent 处理完任务后由 task_processor 拉起，也可走本启动器）：
+    "<pythonw.exe>" "<项目根>\\install\\launch.py" show --title <标题> --text-file <文件>
+
 手动用法：
     python install\\launch.py cli ping
     python install\\launch.py cli file "D:\\资料\\示例.txt"
     python install\\launch.py cli uri "fireloop://task?text=hello"
     python install\\launch.py agent [--pipe-name ...] [--mutex-name ...]
+    python install\\launch.py show --help
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ USAGE = """Fire Loop（火环）启动器 install/launch.py
 用法:
   launch.py cli <参数...>      转发给 fireloop.cli（ping / task / file / uri ...）
   launch.py agent [参数...]    启动常驻 agent（可传 --pipe-name / --mutex-name）
+  launch.py show [参数...]     转发给 fireloop.result_window（结果展示窗口）
   launch.py --help             显示本帮助
 
 说明:
@@ -41,8 +46,8 @@ USAGE = """Fire Loop（火环）启动器 install/launch.py
   它自己把 <项目根>\\src 加进 sys.path，所以不依赖 PYTHONPATH、不挑工作目录。
 
 退出码:
-  透传被转发模块的退出码（cli 按 docs/协议-v1.md；agent 0 正常退出/1 已有实例）；
-  启动器自身参数错误返回 2。
+  透传被转发模块的退出码（cli 按 docs/协议-v1.md；agent 0 正常退出/1 已有实例；
+  show 0 正常关闭/2 参数错误/3 无 GUI）；启动器自身参数错误返回 2。
 """
 
 
@@ -66,8 +71,8 @@ def main(argv: list[str] | None = None) -> int:
     target = args[0]
     rest = args[1:]
 
-    if target not in ("cli", "agent"):
-        print(f"启动器错误：不认识的入口 {target!r}（只支持 cli / agent）", file=sys.stderr)
+    if target not in ("cli", "agent", "show"):
+        print(f"启动器错误：不认识的入口 {target!r}（只支持 cli / agent / show）", file=sys.stderr)
         print(USAGE, end="", file=sys.stderr)
         return 2
 
@@ -79,9 +84,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if target == "cli":
-            from fireloop.cli import main as cli_main
+            from fireloop.cli import main as target_main
+        elif target == "agent":
+            from fireloop.agent import main as target_main
         else:
-            from fireloop.agent import main as agent_main
+            from fireloop.result_window import main as target_main
     except Exception as exc:  # 包坏了要给出可读原因，而不是裸 traceback
         print(
             f"启动器错误：import fireloop 失败（{type(exc).__name__}: {exc}）；"
@@ -90,9 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 4
 
-    if target == "cli":
-        return cli_main(rest)
-    return agent_main(rest)
+    return target_main(rest)
 
 
 if __name__ == "__main__":

@@ -48,7 +48,7 @@ DEFAULT_JSON_PATH = Path(tempfile.gettempdir()) / RESULT_DIR_NAME / (
     f"result-{datetime.now():%Y%m%d-%H%M%S}-pid{os.getpid()}.json"
 )
 
-ALL_SUITES = ("m1a", "b1", "b2")
+ALL_SUITES = ("m1a", "b1", "b2", "m2")
 
 _CTRL_BREAK_EVENT = 1
 
@@ -211,10 +211,12 @@ class Context:
         self,
         skip_graceful_exit: bool = False,
         enable_desktop_events: bool = False,
+        enable_result_window: bool = False,
         suites: tuple[str, ...] = ALL_SUITES,
     ):
         self.skip_graceful_exit = skip_graceful_exit
         self.enable_desktop_events = enable_desktop_events
+        self.enable_result_window = enable_result_window
         self.suites = suites
         self.pid = os.getpid()
         self.tag = f"{self.pid}-{uuid.uuid4().hex[:8]}"
@@ -224,6 +226,9 @@ class Context:
         # B2 事件阶段用的第二套隔离名（第一套在 M1a 阶段结束后已经释放）
         self.events_pipe = self.pipe_name + "-events"
         self.events_mutex = self.mutex_name + "-events"
+        # M2 模型链路阶段用的第三套隔离名
+        self.m2_pipe = self.pipe_name + "-m2"
+        self.m2_mutex = self.mutex_name + "-m2"
         # B1 测试注册表前缀（唯一，绝不等于生产前缀 fireloop）
         self.registry_prefix = f"fireloop-test-{uuid.uuid4().hex[:8]}"
 
@@ -254,21 +259,34 @@ class Context:
 
     # ---------- 子进程 ----------
 
-    def child_env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+    def child_env(
+        self,
+        extra: dict[str, str] | None = None,
+        remove: tuple[str, ...] = (),
+    ) -> dict[str, str]:
         env = os.environ.copy()
         env["FIRELOOP_HOME"] = self.home
         env["PYTHONPATH"] = str(SRC) + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
+        for name in remove:
+            env.pop(name, None)
         if extra:
             env.update(extra)
         return env
 
-    def spawn(self, label: str, args: list[str], **kwargs) -> subprocess.Popen:
+    def spawn(
+        self,
+        label: str,
+        args: list[str],
+        env_extra: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        **kwargs,
+    ) -> subprocess.Popen:
         proc = subprocess.Popen(
             [PYTHON, *args],
             cwd=str(ROOT),
-            env=self.child_env(),
+            env=self.child_env(env_extra, env_remove),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -286,6 +304,8 @@ class Context:
         label: str = "测试 agent",
         extra_args: tuple[str, ...] = (),
         timeout: float = 10.0,
+        env_extra: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
     ) -> tuple[subprocess.Popen, LinePump, str]:
         """起一个隔离 agent 并等启动行；返回 (进程, 输出泵, 启动行)。"""
         proc = self.spawn(
@@ -299,6 +319,8 @@ class Context:
                 mutex_name,
                 *extra_args,
             ],
+            env_extra=env_extra,
+            env_remove=env_remove,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
         pump = LinePump(proc.stdout)
@@ -420,6 +442,7 @@ def print_header(ctx: Context) -> None:
     print(f"项目根目录          : {ROOT}")
     print(f"验收套件            : {', '.join(ctx.suites)}")
     print(f"桌面事件真测        : {'开' if ctx.enable_desktop_events else '关（相关项 SKIP）'}")
+    print(f"结果窗口真测        : {'开' if ctx.enable_result_window else '关（相关项 SKIP）'}")
     print(f"隔离管道            : {ctx.pipe_name}")
     print(f"隔离互斥体          : {ctx.mutex_name}")
     print(f"临时 FIRELOOP_HOME  : {ctx.home}")
@@ -570,11 +593,18 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--enable-result-window",
+        action="store_true",
+        help=(
+            "真测结果展示窗口（会短暂弹窗打扰桌面；默认跳过并标 SKIP，SKIP 不算通过）"
+        ),
+    )
+    parser.add_argument(
         "--suite",
         default="all",
         metavar="LIST",
         help=(
-            "要跑的验收套件：all（默认）或逗号分隔的 m1a,b1,b2，"
+            "要跑的验收套件：all（默认）或逗号分隔的 m1a,b1,b2,m2，"
             "例如 --suite m1a 只跑 M1a 基线回归"
         ),
     )
@@ -588,7 +618,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
             if not name:
                 continue
             if name not in ALL_SUITES:
-                parser.error(f"未知套件 {name!r}（可选：all,m1a,b1,b2）")
+                parser.error(f"未知套件 {name!r}（可选：all,m1a,b1,b2,m2）")
             if name not in selected:
                 selected.append(name)
         if not selected:
@@ -626,6 +656,8 @@ def write_json(ctx: Context) -> tuple[bool, str, int]:
             "mutex_name": ctx.mutex_name,
             "events_pipe_name": ctx.events_pipe,
             "events_mutex_name": ctx.events_mutex,
+            "m2_pipe_name": ctx.m2_pipe,
+            "m2_mutex_name": ctx.m2_mutex,
             "fireloop_home": ctx.home,
             "default_pipe": protocol.PIPE_NAME,
             "default_mutex": DEFAULT_MUTEX_NAME,
@@ -639,6 +671,7 @@ def write_json(ctx: Context) -> tuple[bool, str, int]:
         "options": {
             "skip_graceful_exit": ctx.skip_graceful_exit,
             "enable_desktop_events": ctx.enable_desktop_events,
+            "enable_result_window": ctx.enable_result_window,
         },
         "summary": {
             "total": total,
@@ -672,6 +705,7 @@ def run_main(argv: list[str] | None, pipeline) -> int:
     ctx = Context(
         skip_graceful_exit=args.skip_graceful_exit,
         enable_desktop_events=args.enable_desktop_events,
+        enable_result_window=args.enable_result_window,
         suites=args.suites,
     )
     if args.json_path:

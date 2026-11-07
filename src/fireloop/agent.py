@@ -7,9 +7,12 @@
 3. ``SingleInstance`` 抢互斥体 ``Local\\FireLoopAgent``（可用 ``--mutex-name`` 覆盖，
    验收/测试环境借此与真实常驻 agent 完全隔离），抢不到说明已有实例，退出码 1；
 4. 起 ``PipeServer`` 无限 accept；
-5. 读 ``config.json``（``paths.config_path()``），``events.enabled = true`` 时
-   按 file/clipboard/foreground 各自开关启动事件 watcher —— **默认全关**，
-   所以 M1a 行为完全不变；退出时在 ``finally`` 里把所有 watcher stop 掉。
+5. 读 ``config.json``（``paths.config_path()``，由 ``config.load_config()`` 统一规范化
+   成 events/model/ui 三段）：``events.enabled = true`` 时按 file/clipboard/foreground
+   各自开关启动事件 watcher（**默认全关**）；``model.enabled = true`` 时把 "file:"
+   开头的 task 交给 ``TaskProcessor`` 异步处理（单线程串行调模型），**默认关闭**，
+   关闭时 file task 也只是回显，M1a 行为不变；退出时在 ``finally`` 里停止 processor
+   和所有 watcher。
 
 Ctrl+C：Windows 控制台里主线程正阻塞在 ``ConnectNamedPipe``，Python 的
 KeyboardInterrupt 打不断 C 调用，所以额外用 ``SetConsoleCtrlHandler`` 注册
@@ -25,13 +28,15 @@ import sys
 import threading
 from ctypes import wintypes
 
-from . import log, paths, protocol
+from . import log, paths, protocol, task_processor
 from .clipboard_watcher import ClipboardWatcher
-from .events import EventBus, enabled_watchers, load_config
+from .config import load_config
+from .events import EventBus, enabled_watchers
 from .file_watcher import FileWatcher
 from .foreground_watcher import ForegroundWatcher
 from .pipe_server import PipeServer
 from .single_instance import DEFAULT_MUTEX_NAME, SingleInstance
+from .task_processor import TaskProcessor, model_config
 
 _CTRL_C_EVENT = 0
 _CTRL_BREAK_EVENT = 1
@@ -50,7 +55,7 @@ _console_handler = None  # 全局持有回调引用，防止被 GC 回收
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fireloop.agent",
-        description="Fire Loop 常驻 agent（M1a：命名管道 + JSON Lines，不接模型）",
+        description="Fire Loop 常驻 agent（命名管道 + JSON Lines；M2 支持右键文件分析）",
     )
     parser.add_argument(
         "--pipe-name",
@@ -171,6 +176,82 @@ def stop_event_watchers(watchers: list) -> None:
     log.log_event("events_stopped", count=len(watchers))
 
 
+def build_file_task_reply(
+    msg: dict,
+    processor: TaskProcessor | None,
+    model_cfg: dict | None,
+) -> dict | None:
+    """M2：判断一条请求是不是"要交给任务处理器"的 file task，并尝试入队。
+
+    返回要回给客户端的响应 dict；返回 ``None`` 表示"不归任务处理器管"，
+    交给 ``PipeServer._dispatch`` 的原逻辑（ping/task 回显、错误帧等）。
+
+    归任务处理器管的条件（task-14 契约）：
+    - type == task；text 以 ``file:`` 开头；
+    - 配置里 ``model.enabled == True`` 且 ``model.file_enabled == True``；
+    - 有非空 id、file: 后面有路径。
+    入队失败（去重/配额/队列满/正在退出）回 ``ok=true, queued=false, reason=<码>``，
+    让 CLI 能明确显示"任务未提交"及原因（协议 v1 没有专门的配额错误码）。
+    """
+    if not isinstance(msg, dict) or msg.get("type") != protocol.TASK:
+        return None
+    if processor is None or not isinstance(model_cfg, dict):
+        return None
+    if not (
+        model_cfg.get("enabled") is True and model_cfg.get("file_enabled") is True
+    ):
+        return None
+
+    text = msg.get("text")
+    req_id = msg.get("id")
+    if not isinstance(text, str) or not text.startswith(task_processor.FILE_TASK_PREFIX):
+        return None
+    if not isinstance(req_id, str) or not req_id:
+        return None  # 缺 id：交给父类回 bad_msg
+    try:
+        task_processor.parse_file_task(text)
+    except ValueError:
+        return None  # file: 后路径为空等非法值：交给父类原逻辑
+
+    queued, reason = processor.submit_with_reason(text, req_id)
+    if queued:
+        return protocol.make_ok(req_id, text="收到任务，正在处理…", queued=True)
+    if reason not in task_processor.REASON_TEXT:
+        return None
+    return protocol.make_ok(
+        req_id,
+        text=f"任务未提交：{task_processor.REASON_TEXT[reason]}",
+        queued=False,
+        reason=reason,
+    )
+
+
+class AgentPipeServer(PipeServer):
+    """agent 专用管道服务端：在父类协议分派前拦一层 M2 file task。
+
+    ``pipe_server.py`` 保持通用（不 import llm / task_processor）；M2 的业务钩子
+    放在 agent 层，通过覆写 ``_dispatch`` 实现，管道实现本身不用改。
+    """
+
+    def __init__(
+        self,
+        pipe_name: str = protocol.PIPE_NAME,
+        token: str | None = None,
+        processor: TaskProcessor | None = None,
+        model_cfg: dict | None = None,
+        validate_sid: bool = True,
+    ):
+        super().__init__(pipe_name=pipe_name, token=token, validate_sid=validate_sid)
+        self._processor = processor
+        self._model_cfg = dict(model_cfg) if isinstance(model_cfg, dict) else {}
+
+    def _dispatch(self, msg: dict) -> dict:
+        reply = build_file_task_reply(msg, self._processor, self._model_cfg)
+        if reply is not None:
+            return reply
+        return super()._dispatch(msg)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -187,10 +268,28 @@ def main(argv: list[str] | None = None) -> int:
 
     server = None
     watchers: list = []  # 事件 watcher；默认配置（events.enabled=false）保持为空
+    processor: TaskProcessor | None = None  # M2 任务处理器；见下方 start/stop
     try:
-        # 事件配置：文件不存在/坏 JSON 都会安全回落到"全关"的默认配置。
+        # 统一配置（events/model/ui 三段）：文件不存在/坏 JSON 都安全回落到默认。
         config = load_config()
-        server = PipeServer(pipe_name=args.pipe_name, token=token)
+        model_cfg = model_config(config)
+
+        # M2：任务处理器默认配置（model.enabled=false）下只是空转线程，不联网；
+        # 只有 file task + 模型启用时才真正工作。
+        processor = TaskProcessor(config)
+        processor.start()
+
+        if model_cfg.get("enabled"):
+            server = AgentPipeServer(
+                pipe_name=args.pipe_name,
+                token=token,
+                processor=processor,
+                model_cfg=model_cfg,
+            )
+        else:
+            # 模型没启用时不需要 M2 分派层：用原 PipeServer，M1 行为完全一致
+            # （也保住了 tests/test_pipe_server.py 里对 PipeServer 构造的 mock）。
+            server = PipeServer(pipe_name=args.pipe_name, token=token)
         try:
             _install_console_handler(server)
             # 默认配置下这里返回 (None, [])，不创建任何监听线程，M1a 行为不变。
@@ -203,6 +302,16 @@ def main(argv: list[str] | None = None) -> int:
             log.log_event("agent_stop_requested", reason="keyboard_interrupt")
     finally:
         stop_event_watchers(watchers)
+        if processor is not None:
+            try:
+                processor.stop(timeout=5.0)
+            except Exception as exc:  # 停止失败也不能卡住 agent 退出
+                log.log_event(
+                    "task_processor_error",
+                    level="warning",
+                    stage="stop",
+                    error=type(exc).__name__,
+                )
         instance.release()
 
     print("Fire Loop agent 已退出", flush=True)

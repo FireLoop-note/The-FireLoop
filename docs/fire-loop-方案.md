@@ -135,6 +135,19 @@ D:\ds植入式\
 - 事件去抖、去重、配额、`event_dispatch` 日志；
 - 管道调用方 SID 校验。
 
+### M2 模型接入：右键文件处理（当前）
+
+做：DeepSeek `deepseek-flash` 接入（OpenAI 兼容接口，标准库 urllib，请求体关闭 thinking——实测默认 thinking 会烧光 max_tokens 导致 content 为空）；右键文件 → CLI `file` → agent 单线程队列 → 读文件（默认 20000 字符上限，超限截断标注）→ 模型给"一句话说明 + 要点 + 风险" → 结果写 `%LOCALAPPDATA%\FireLoop\results\` 并用 pythonw 弹结果窗口；每日调用配额 100、60 秒去重、失败给可读错误；key 存 `%LOCALAPPDATA%\FireLoop\secrets.json`（ACL 只当前用户、不进仓库、日志不记）。
+
+验收记录（2026-11-07，Lead 真跑）：
+
+- [x] CLI/右键 file 触发后立即回"收到任务，正在处理…"，模型调用异步进行
+- [x] 真实 DeepSeek 调用成功：`README.md` 摘要 2960ms，prompt 696 / completion 310 tokens，结果窗口弹出标题"火环 · 文件分析"
+- [x] 无 key / HTTP 500 / 超时 → 可读错误，agent 不崩
+- [x] 每日配额、60s 去重、大文件截断、普通 task 回显回归
+- [x] 日志无 key、无文件正文；验收套件 48 项 PASS 44 / FAIL 0 / SKIP 4（SKIP 项明确不算通过）
+- [x] 真实调用成本：3 次调用合计约 0.002 元人民币
+
 ### 服务化
 
 第一阶段不做，甚至不做。只有确实需要"登录前也能跑"才重新评估。

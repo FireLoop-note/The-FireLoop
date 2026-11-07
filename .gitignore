@@ -9,6 +9,8 @@ venv/
 logs/
 *.log
 config.json
+secrets*.json
+*.key
 agent.token
 run/
 *.pid
