@@ -3,6 +3,8 @@
 用法：
     python -m fireloop.cli ping
     python -m fireloop.cli task "任务文本"
+    python -m fireloop.cli file "D:\\资料\\示例.txt"
+    python -m fireloop.cli uri "fireloop://task?text=hello"
     python -m fireloop.cli ping --pipe-name "\\\\.\\pipe\\fireloop-implant"
 
 退出码（docs/协议-v1.md 第 6 节）：
@@ -17,28 +19,41 @@ CLI 是短命进程：绝不自己生成 token、绝不常驻、任何输入都�
 
 from __future__ import annotations
 
+import os
 import sys
+import urllib.parse
 import uuid
 
 from . import client, protocol
 
 EXIT_USAGE = protocol.CLI_EXIT_INTERNAL  # 用法错误用 4（协议里 4 = 内部错误）
 
+# fireloop:// 协议（M1b 注册；这里只负责 CLI 侧解析）
+URI_SCHEME = "fireloop"
+URI_HOST_TASK = "task"
+URI_HOST_FILE = "file"
+
 USAGE = """Fire Loop CLI（火环）
 
 用法:
   python -m fireloop.cli ping
   python -m fireloop.cli task "任务文本"
+  python -m fireloop.cli file "D:\\资料\\示例.txt"
+  python -m fireloop.cli uri "fireloop://task?text=hello"
   python -m fireloop.cli <命令> --pipe-name "\\\\.\\pipe\\fireloop-implant"
 
 命令:
   ping              探测 agent 是否在运行，成功打印 pong
   task "文本"        把任务文本发给 agent，成功打印服务端回的 text
+  file "路径"        把路径作为任务发送：task.text = "file:<绝对路径>"（相对路径转绝对，不检查存在）
+  uri "链接"         解析 fireloop:// 链接后发任务（参数值需 URL 编码）：
+                       fireloop://task?text=文本   → task.text = 文本（URL 解码）
+                       fireloop://file?path=路径   → task.text = "file:路径"（URL 解码）
 
 选项:
   --pipe-name <名>   覆盖默认管道名
   -h, --help         显示本帮助
-  --                 后续参数一律当位置参数（任务文本以 - 开头时用）
+  --                 后续参数一律当位置参数（参数以 - 开头时用）
 
 退出码:
   0 成功 / 1 agent 没在运行 / 2 超时 / 3 协议错误 / 4 用法或内部错误
@@ -83,11 +98,82 @@ def _parse_args(argv: list[str]) -> tuple[str, list[str]]:
     return pipe_name, positionals
 
 
+def _require_single_arg(command: str, positionals: list[str], example: str) -> str:
+    """命令后面必须跟且只跟一个参数。"""
+    if len(positionals) < 2:
+        raise UsageError(f"{command} 缺少参数，例如：{example}")
+    if len(positionals) > 2:
+        raise UsageError(f"{command} 只接受一个参数；参数含空格时请用引号括起来")
+    return positionals[1]
+
+
+def _decode_uri_value(value: str) -> str:
+    """URL 百分号解码。
+
+    只做 %XX 解码，不把 + 当空格（form 编码那套）：Windows 路径里 + 是合法字符，
+    真实链接里空格应编码成 %20。install.ps1 生成链接时请用 [uri]::EscapeDataString。
+    """
+    return urllib.parse.unquote(value, encoding="utf-8", errors="replace")
+
+
+def _query_params(query: str) -> dict[str, list[str]]:
+    """解析 query 字面量（值做百分号解码，+ 保留原样）。重复 key 返回列表。"""
+    params: dict[str, list[str]] = {}
+    for chunk in query.split("&"):
+        if not chunk:
+            continue
+        key, sep, value = chunk.partition("=")
+        params.setdefault(_decode_uri_value(key), []).append(
+            _decode_uri_value(value if sep else "")
+        )
+    return params
+
+
+def _first_query_param(params: dict[str, list[str]], name: str) -> str | None:
+    values = params.get(name)
+    return values[0] if values else None
+
+
+def _text_from_uri(uri: str) -> str:
+    """fireloop://task?text=xxx / fireloop://file?path=xxx → 要发送的 task.text。
+
+    其他 scheme、其他 host、参数缺失或为空 → UsageError（CLI 退出码 4）。
+    """
+    if not uri.strip():
+        raise UsageError("uri 参数不能为空")
+
+    parts = urllib.parse.urlsplit(uri)
+    if parts.scheme.lower() != URI_SCHEME:
+        raise UsageError(f"不是 fireloop:// 链接：{uri}")
+
+    host = parts.netloc.lower()
+    if host not in (URI_HOST_TASK, URI_HOST_FILE):
+        raise UsageError(
+            f"不支持的 fireloop:// 目标：{host or '(空)'}（只支持 task / file）"
+        )
+
+    params = _query_params(parts.query)
+    if host == URI_HOST_TASK:
+        text = _first_query_param(params, "text")
+        if text is None:
+            raise UsageError("fireloop://task 缺少 text 参数")
+        if not text.strip():
+            raise UsageError("fireloop://task 的 text 不能为空")
+        return text
+
+    path = _first_query_param(params, "path")
+    if path is None:
+        raise UsageError("fireloop://file 缺少 path 参数")
+    if not path.strip():
+        raise UsageError("fireloop://file 的 path 不能为空")
+    return "file:" + path
+
+
 def _build_message(argv: list[str]) -> tuple[dict, str]:
     """把命令行转成请求帧；返回 (消息, 管道名)。参数错抛 UsageError。"""
     pipe_name, positionals = _parse_args(argv)
     if not positionals:
-        raise UsageError("缺少命令（ping 或 task）")
+        raise UsageError("缺少命令（ping / task / file / uri）")
 
     command = positionals[0]
     if command == "ping":
@@ -105,7 +191,25 @@ def _build_message(argv: list[str]) -> tuple[dict, str]:
             raise UsageError("task 文本不能为空")
         return protocol.make_task(uuid.uuid4().hex, text), pipe_name
 
-    raise UsageError(f"不认识的命令：{command}（只支持 ping / task）")
+    if command == "file":
+        raw = _require_single_arg(
+            command,
+            positionals,
+            'python -m fireloop.cli file "D:\\资料\\示例.txt"',
+        )
+        if not raw.strip():
+            raise UsageError("file 路径不能为空")
+        return protocol.make_task(uuid.uuid4().hex, "file:" + os.path.abspath(raw)), pipe_name
+
+    if command == "uri":
+        raw = _require_single_arg(
+            command,
+            positionals,
+            'python -m fireloop.cli uri "fireloop://task?text=hello"',
+        )
+        return protocol.make_task(uuid.uuid4().hex, _text_from_uri(raw)), pipe_name
+
+    raise UsageError(f"不认识的命令：{command}（只支持 ping / task / file / uri）")
 
 
 def _print_error(message: str) -> None:

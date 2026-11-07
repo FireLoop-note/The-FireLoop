@@ -9,6 +9,7 @@
 - 超时：连上但故意不响应 → AgentTimeoutError，CLI 退出码 2；
 - 参数错误：task 缺失/为空、未知命令、未知选项 → CLI 退出码 4；
 - --pipe-name 生效；
+- B1：file / uri 子命令（task.text 格式、URL 解码中文空格、非法链接、退出码、真子进程）；
 - T1 的 PipeServer 已就绪时，另跑一组真服务端端到端（未就绪自动 skip）。
 
 说明：默认服务端是测试内的 fake 服务端（worker-server 的 pipe_server.py 未就绪时先用它），
@@ -26,6 +27,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 import uuid
 from ctypes import wintypes
 from pathlib import Path
@@ -296,13 +298,14 @@ def _handle_hello(conn, server):
 
 
 def _handler_ok(server, handle):
-    """正常服务端：hello 鉴权 → ping 回 pong / task 回「收到任务」。"""
+    """正常服务端：hello 鉴权 → ping 回 pong / task 回「收到任务」。记录收到的请求。"""
     conn = _Conn(server, handle)
     if not _handle_hello(conn, server):
         return
     req = conn.read_msg()
     if req is None:
         return
+    server.requests.append(req)
     mtype = req.get("type")
     if mtype == protocol.PING:
         conn.send(protocol.make_ok(req.get("id"), text="pong"))
@@ -371,6 +374,7 @@ class FakePipeServer:
         self.max_instances = max_instances
         self.error = None
         self.connections = 0
+        self.requests = []  # _handler_ok 收到的请求帧，供断言 CLI 实际发了什么
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._thread = threading.Thread(
@@ -691,6 +695,113 @@ class ArgvTest(unittest.TestCase):
         self.assertEqual(code, protocol.CLI_EXIT_OK)
         self.assertIn("用法", out)
         self.assertEqual(err, "")
+        self.assertIn("file", out)
+        self.assertIn("uri", out)
+
+    # --- B1：file 子命令 ---
+
+    def test_file_message_absolute(self):
+        path = r"C:\资料\a b.txt"
+        msg, _ = cli._build_message(["file", path])
+        self.assertEqual(msg["type"], protocol.TASK)
+        self.assertEqual(msg["text"], "file:" + path)
+
+    def test_file_message_relative_becomes_absolute(self):
+        relative = r"sub\相对 路径.txt"
+        msg, _ = cli._build_message(["file", relative])
+        expected = "file:" + os.path.abspath(relative)
+        self.assertEqual(msg["text"], expected)
+        self.assertTrue(os.path.isabs(msg["text"][len("file:"):]))
+        self.assertNotEqual(msg["text"], "file:" + relative)  # 已变成绝对路径
+
+    def test_file_does_not_check_existence(self):
+        missing = str(Path(tempfile.gettempdir()) / "fireloop-绝对不存在-12345.txt")
+        msg, _ = cli._build_message(["file", missing])
+        self.assertEqual(msg["text"], "file:" + missing)
+
+    def test_file_empty_path_is_usage_error(self):
+        for args in (["file"], ["file", ""], ["file", "   "]):
+            code, out, err = self.run_main(args)
+            self.assertEqual(code, cli.EXIT_USAGE, f"args={args!r}")
+            self.assertEqual(out, "")
+            self.assertIn("用法错误", err)
+
+    def test_file_extra_arg_is_usage_error(self):
+        self.assertEqual(self.run_main(["file", "a.txt", "b.txt"])[0], cli.EXIT_USAGE)
+
+    # --- B1：uri 子命令 ---
+
+    def test_uri_task_text_encoded(self):
+        uri = "fireloop://task?text=%E4%BD%A0%E5%A5%BD%20world"
+        msg, _ = cli._build_message(["uri", uri])
+        self.assertEqual(msg["type"], protocol.TASK)
+        self.assertEqual(msg["text"], "你好 world")
+
+    def test_uri_task_raw_chinese_and_space(self):
+        msg, _ = cli._build_message(["uri", "fireloop://task?text=打开 记事本"])
+        self.assertEqual(msg["text"], "打开 记事本")
+
+    def test_uri_file_path_encoded(self):
+        uri = "fireloop://file?path=C%3A%5C%E8%B5%84%E6%96%99%5Ca%20b.txt"
+        msg, _ = cli._build_message(["uri", uri])
+        self.assertEqual(msg["text"], r"file:C:\资料\a b.txt")
+
+    def test_uri_file_path_raw_backslashes(self):
+        msg, _ = cli._build_message(["uri", r"fireloop://file?path=C:\资料\a b.txt"])
+        self.assertEqual(msg["text"], r"file:C:\资料\a b.txt")
+
+    def test_uri_plus_is_kept_literal(self):
+        # 路径里的 + 不能被当成空格（百分号编码才是空格），install.ps1 用 EscapeDataString
+        msg, _ = cli._build_message(["uri", r"fireloop://file?path=C:\a+b.txt"])
+        self.assertEqual(msg["text"], r"file:C:\a+b.txt")
+
+    def test_uri_percent_and_hash_decoded(self):
+        msg, _ = cli._build_message(["uri", "fireloop://task?text=100%25%23done"])
+        self.assertEqual(msg["text"], "100%#done")
+
+    def test_uri_scheme_host_case_insensitive(self):
+        msg, _ = cli._build_message(["uri", "FIRELOOP://TASK?text=ABC"])
+        self.assertEqual(msg["text"], "ABC")
+
+    def test_uri_invalid_scheme_is_usage_error(self):
+        for uri in ("http://example.com/x", "file:///C:/x.txt", "not-a-uri", ""):
+            code, _, err = self.run_main(["uri", uri])
+            self.assertEqual(code, cli.EXIT_USAGE, f"uri={uri!r}")
+            self.assertIn("用法错误", err)
+
+    def test_uri_unknown_host_is_usage_error(self):
+        for uri in ("fireloop://nope?text=x", "fireloop://", "fireloop:task?text=x"):
+            code, _, err = self.run_main(["uri", uri])
+            self.assertEqual(code, cli.EXIT_USAGE, f"uri={uri!r}")
+            self.assertIn("用法错误", err)
+
+    def test_uri_missing_or_empty_param_is_usage_error(self):
+        for uri in (
+            "fireloop://task",
+            "fireloop://task?text=",
+            "fireloop://task?text=%20",
+            "fireloop://file",
+            "fireloop://file?path=",
+            "fireloop://file?path=%20",
+        ):
+            code, _, err = self.run_main(["uri", uri])
+            self.assertEqual(code, cli.EXIT_USAGE, f"uri={uri!r}")
+            self.assertIn("用法错误", err)
+
+    def test_uri_extra_arg_is_usage_error(self):
+        self.assertEqual(self.run_main(["uri", "fireloop://task?text=a", "b"])[0], cli.EXIT_USAGE)
+
+    def test_uri_extra_params_and_fragment_ignored(self):
+        msg, _ = cli._build_message(["uri", "fireloop://task?text=hi&extra=1#frag"])
+        self.assertEqual(msg["text"], "hi")
+        msg, _ = cli._build_message(["uri", "fireloop://task?text=hi#frag"])
+        self.assertEqual(msg["text"], "hi")
+
+    def test_uri_text_too_long_is_usage_error(self):
+        uri = "fireloop://task?text=" + ("x" * (protocol.MAX_TASK_TEXT + 1))
+        code, _, err = self.run_main(["uri", uri])
+        self.assertEqual(code, cli.EXIT_USAGE)
+        self.assertIn("协议", err)
 
 
 # ---------------------------------------------------------------------------
@@ -864,6 +975,56 @@ class CliEndToEndTest(ClientTestBase):
         self.assertEqual(proc.returncode, cli.EXIT_USAGE, proc.stderr)
         self.assertIn("用法错误", proc.stderr)
 
+    # --- B1：file / uri 子命令端到端（真子进程 + 真管道 + fake 服务端） ---
+
+    def test_file_sends_absolute_path(self):
+        token = self.write_token()
+        server = self.start_server(_handler_ok, token=token)
+        path = str(self.home / "资料" / "a b.txt")  # 不存在也行，file 不检查存在性
+        proc = self.run_cli(["file", path], pipe_name=server.pipe_name)
+        self.assertEqual(proc.returncode, protocol.CLI_EXIT_OK, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "收到任务")
+        self.assertEqual(server.requests[-1]["type"], protocol.TASK)
+        self.assertEqual(server.requests[-1]["text"], "file:" + path)
+
+    def test_uri_task_sends_decoded_text(self):
+        token = self.write_token()
+        server = self.start_server(_handler_ok, token=token)
+        uri = "fireloop://task?text=%E6%89%93%E5%BC%80%20%E8%AE%B0%E4%BA%8B%E6%9C%AC"
+        proc = self.run_cli(["uri", uri], pipe_name=server.pipe_name)
+        self.assertEqual(proc.returncode, protocol.CLI_EXIT_OK, proc.stderr)
+        self.assertEqual(server.requests[-1]["text"], "打开 记事本")
+
+    def test_uri_file_sends_file_text(self):
+        token = self.write_token()
+        server = self.start_server(_handler_ok, token=token)
+        path = str(self.home / "资料" / "a b.txt")
+        encoded = urllib.parse.quote(path, safe="")  # 等价于 .NET Uri.EscapeDataString
+        proc = self.run_cli(
+            ["uri", "fireloop://file?path=" + encoded], pipe_name=server.pipe_name
+        )
+        self.assertEqual(proc.returncode, protocol.CLI_EXIT_OK, proc.stderr)
+        self.assertEqual(server.requests[-1]["text"], "file:" + path)
+
+    def test_uri_invalid_exit4(self):
+        proc = self.run_cli(["uri", "https://example.com/x"])
+        self.assertEqual(proc.returncode, cli.EXIT_USAGE, proc.stderr)
+        self.assertIn("用法错误", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_file_empty_exit4(self):
+        proc = self.run_cli(["file", ""])
+        self.assertEqual(proc.returncode, cli.EXIT_USAGE, proc.stderr)
+        self.assertIn("用法错误", proc.stderr)
+
+    def test_new_commands_without_agent_exit1(self):
+        self.write_token()
+        for args in (["file", r"C:\nonexistent\a.txt"], ["uri", "fireloop://task?text=hello"]):
+            proc = self.run_cli(args, pipe_name=self.unique_pipe())
+            self.assertEqual(proc.returncode, protocol.CLI_EXIT_OFFLINE, proc.stderr)
+            self.assertIn("没在运行", proc.stderr)
+
 
 # ---------------------------------------------------------------------------
 # 5. 真服务端端到端：直接 import T1 的 PipeServer（只读使用，不改它的文件）
@@ -974,6 +1135,15 @@ class RealPipeServerEndToEndTest(ClientTestBase):
         proc = self.run_cli_until_ready(["ping"], server.pipe_name)
         self.assertEqual(proc.returncode, protocol.CLI_EXIT_PROTOCOL, proc.stderr)
         self.assertIn(protocol.CODE_BAD_TOKEN, proc.stderr)
+
+    def test_cli_uri_against_real_pipe_server(self):
+        token = self.write_token()
+        server = self.start_real_server(token)
+        proc = self.run_cli_until_ready(
+            ["uri", "fireloop://task?text=%E4%BD%A0%E5%A5%BD"], server.pipe_name
+        )
+        self.assertEqual(proc.returncode, protocol.CLI_EXIT_OK, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "收到任务")
 
 
 if __name__ == "__main__":

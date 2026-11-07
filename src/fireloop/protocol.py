@@ -42,6 +42,7 @@ CODE_TOO_LARGE = "too_large"
 CODE_UNKNOWN_TYPE = "unknown_type"
 CODE_TIMEOUT = "timeout"
 CODE_INTERNAL = "internal"
+CODE_UNAUTHORIZED = "unauthorized"
 
 ALLOWED_TYPES = frozenset({HELLO, HELLO_OK, PING, TASK, RESULT})
 

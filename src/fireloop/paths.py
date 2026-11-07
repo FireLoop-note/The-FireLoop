@@ -36,6 +36,11 @@ def token_path() -> Path:
     return home() / "agent.token"
 
 
+def config_path() -> Path:
+    """配置文件路径：%LOCALAPPDATA%\\FireLoop\\config.json。不存在即用默认配置。"""
+    return home() / "config.json"
+
+
 def ensure_dirs() -> None:
     """创建数据目录。幂等。"""
     for d in (home(), logs_dir(), run_dir()):

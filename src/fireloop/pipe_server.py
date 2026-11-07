@@ -1,15 +1,20 @@
 """Fire Loop 命名管道服务端（ctypes 直调 Win32，零第三方依赖）。
 
-线协议见 docs/协议-v1.md，M1a 约定：
+线协议见 docs/协议-v1.md，M1a/M1b 约定：
 
-- 短连接：一个连接先做 hello token 鉴权，再处理若干请求，然后断开，回到 accept；
+- 短连接：一个连接先做调用方 SID 校验（M1b），再 hello token 鉴权，然后处理若干请求，
+  最后断开，回到 accept；
+- 调用方 SID 不是当前用户（M1b）→ 回 ``unauthorized`` 并断开；
 - 首帧必须是合法 hello 且 token 与构造参数一致，否则回 ``bad_token`` 并断开；
+- 首帧等待最多 ``protocol.HELLO_TIMEOUT_MS``，用 PeekNamedPipe 轮询 + deadline，
+  绝不阻塞 ReadFile 干等；超时回错误帧并断开；
 - 请求只认 ping / task；task 只回显，不执行、不落盘；
 - 单行上限 ``protocol.MAX_LINE_BYTES``，超限回 ``too_large`` 并断开；
 - 单个连接里的任何异常只断开该连接并记日志，serve_forever 循环绝不崩；
-- 日志不出现任务原文，只记 ``protocol.text_fingerprint``。
+- 日志不出现任务原文，只记 ``protocol.text_fingerprint``；
+- 日志事件含 ``unauthorized`` / ``hello_timeout``。
 
-实现要点：内核对象全部用 ctypes 直调 kernel32；句柄由本类自己管理，
+实现要点：内核对象全部用 ctypes 直调 kernel32 / advapi32；句柄由本类自己管理，
 阻塞在 ``ConnectNamedPipe`` 时可通过 stop() 的"自我连接"唤醒（见 stop 注释）。
 """
 
@@ -51,6 +56,13 @@ ERROR_PIPE_CONNECTED = 535
 _EOF_WINERRORS = frozenset({0, ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED, ERROR_NO_DATA})
 
 READ_CHUNK = 8192
+
+# ---- M1b：调用方身份（SID）校验 + 首帧 hello 超时 ----
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+TOKEN_QUERY = 0x00000008
+TOKEN_USER_CLASS = 1  # TOKEN_INFORMATION_CLASS.TokenUser
+ERROR_INSUFFICIENT_BUFFER = 122
+HELLO_POLL_INTERVAL = 0.01  # 首帧 PeekNamedPipe 轮询间隔（秒）
 
 # 64 位下 c_void_p(-1) 是 0xFFFFFFFFFFFFFFFF；CreateNamedPipeW/CreateFileW 失败都返回它。
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
@@ -118,6 +130,70 @@ _CreateFileW.argtypes = (
 )
 _CreateFileW.restype = wintypes.HANDLE
 
+# ---- M1b：SID 校验 / hello 超时用到的内核调用 ----
+
+_GetCurrentProcess = _kernel32.GetCurrentProcess
+_GetCurrentProcess.argtypes = ()
+_GetCurrentProcess.restype = wintypes.HANDLE
+
+_OpenProcess = _kernel32.OpenProcess
+_OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+_OpenProcess.restype = wintypes.HANDLE
+
+_GetNamedPipeClientProcessId = _kernel32.GetNamedPipeClientProcessId
+_GetNamedPipeClientProcessId.argtypes = (wintypes.HANDLE, wintypes.LPDWORD)
+_GetNamedPipeClientProcessId.restype = wintypes.BOOL
+
+_PeekNamedPipe = _kernel32.PeekNamedPipe
+_PeekNamedPipe.argtypes = (
+    wintypes.HANDLE,  # hNamedPipe
+    wintypes.LPVOID,  # lpBuffer（传 NULL 只查可读字节数）
+    wintypes.DWORD,  # nBufferSize
+    wintypes.LPDWORD,  # lpBytesRead
+    wintypes.LPDWORD,  # lpTotalBytesAvail
+    wintypes.LPDWORD,  # lpBytesLeftThisMessage
+)
+_PeekNamedPipe.restype = wintypes.BOOL
+
+_LocalFree = _kernel32.LocalFree
+_LocalFree.argtypes = (ctypes.c_void_p,)
+_LocalFree.restype = ctypes.c_void_p
+
+_advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+_OpenProcessToken = _advapi32.OpenProcessToken
+_OpenProcessToken.argtypes = (
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.HANDLE),
+)
+_OpenProcessToken.restype = wintypes.BOOL
+
+_GetTokenInformation = _advapi32.GetTokenInformation
+_GetTokenInformation.argtypes = (
+    wintypes.HANDLE,
+    ctypes.c_int,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+)
+_GetTokenInformation.restype = wintypes.BOOL
+
+_ConvertSidToStringSidW = _advapi32.ConvertSidToStringSidW
+_ConvertSidToStringSidW.argtypes = (wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR))
+_ConvertSidToStringSidW.restype = wintypes.BOOL
+
+
+class _SID_AND_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("Sid", wintypes.LPVOID),
+        ("Attributes", wintypes.DWORD),
+    ]
+
+
+class _TOKEN_USER(ctypes.Structure):
+    _fields_ = [("User", _SID_AND_ATTRIBUTES)]
+
 
 class _ConnectionClosed(Exception):
     """连接已断开（客户端关闭 / 管道错误）。winerror=0 表示正常 EOF。"""
@@ -129,6 +205,10 @@ class _ConnectionClosed(Exception):
 
 class _LineTooLarge(Exception):
     """单行超过 protocol.MAX_LINE_BYTES。"""
+
+
+class _HelloTimeout(Exception):
+    """首帧 hello 在 protocol.HELLO_TIMEOUT_MS 内没到齐。"""
 
 
 def _is_invalid_handle(handle) -> bool:
@@ -209,6 +289,56 @@ def _read_line(handle, buffer: bytearray) -> bytes:
         buffer += chunk.raw[: nread.value]
 
 
+def _peek_available(handle) -> int | None:
+    """PeekNamedPipe 查管道里可读字节数；None 表示连接已断开。"""
+    avail = wintypes.DWORD(0)
+    if not _PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None):
+        return None
+    return int(avail.value)
+
+
+def _read_chunk(handle, size: int) -> bytes:
+    """读走当前已就绪的 size 字节（调用前已 Peek 过，不会阻塞）。"""
+    size = max(1, int(size))
+    chunk = ctypes.create_string_buffer(size)
+    nread = wintypes.DWORD(0)
+    if not _ReadFile(handle, chunk, size, ctypes.byref(nread), None):
+        raise _ConnectionClosed(ctypes.get_last_error())
+    if nread.value == 0:
+        raise _ConnectionClosed(0)
+    return chunk.raw[: nread.value]
+
+
+def _read_line_with_timeout(handle, buffer: bytearray, timeout_ms: int) -> bytes:
+    """带 deadline 地读一行（首帧 hello 专用）。
+
+    用 PeekNamedPipe 轮询"有没有数据"，有数据才 ReadFile，绝不在没数据时阻塞 ReadFile
+    干等。超时抛 _HelloTimeout，超长抛 _LineTooLarge，断开抛 _ConnectionClosed。
+    """
+    deadline = time.monotonic() + max(0, int(timeout_ms)) / 1000.0
+    while True:
+        newline_at = buffer.find(b"\n")
+        if newline_at >= 0:
+            if newline_at + 1 > protocol.MAX_LINE_BYTES:
+                raise _LineTooLarge()
+            line = bytes(buffer[:newline_at])
+            del buffer[: newline_at + 1]
+            return line
+        if len(buffer) > protocol.MAX_LINE_BYTES:
+            raise _LineTooLarge()
+
+        avail = _peek_available(handle)
+        if avail is None:
+            raise _ConnectionClosed(ctypes.get_last_error())
+        if avail == 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _HelloTimeout()
+            time.sleep(min(HELLO_POLL_INTERVAL, remaining))
+            continue
+        buffer += _read_chunk(handle, avail)
+
+
 def _send_frame(handle, msg: dict, flush: bool = False) -> None:
     """编码并写出一帧。
 
@@ -246,6 +376,85 @@ def _try_connect_once(pipe_name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# M1b：调用方 SID 校验
+# ---------------------------------------------------------------------------
+
+
+def _token_user_sid(token_handle) -> str | None:
+    """从已打开的进程令牌取用户 SID 字符串；任何失败返回 None（不抛异常）。"""
+    size = wintypes.DWORD(0)
+    # 第一次调用只为拿 SIZE；预期返回失败 + ERROR_INSUFFICIENT_BUFFER。
+    _GetTokenInformation(token_handle, TOKEN_USER_CLASS, None, 0, ctypes.byref(size))
+    if not size.value:
+        return None
+
+    buf = ctypes.create_string_buffer(size.value)
+    if not _GetTokenInformation(
+        token_handle, TOKEN_USER_CLASS, buf, size.value, ctypes.byref(size)
+    ):
+        return None
+
+    token_user = ctypes.cast(buf, ctypes.POINTER(_TOKEN_USER)).contents
+    sid = token_user.User.Sid
+    if not sid:
+        return None
+
+    sid_text = wintypes.LPWSTR()
+    if not _ConvertSidToStringSidW(sid, ctypes.byref(sid_text)):
+        return None
+    try:
+        return sid_text.value
+    finally:
+        _LocalFree(ctypes.cast(sid_text, ctypes.c_void_p))
+
+
+def _current_user_sid() -> str | None:
+    """当前进程（agent）用户的 SID 字符串；拿不到返回 None。"""
+    token = wintypes.HANDLE()
+    if not _OpenProcessToken(_GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
+        return None
+    try:
+        return _token_user_sid(token)
+    finally:
+        if token.value:
+            _CloseHandle(token)
+
+
+def _process_user_sid(pid: int) -> str | None:
+    """指定进程用户的 SID 字符串；进程打不开（权限/已退出）返回 None。"""
+    pid = int(pid or 0)
+    if pid <= 0:
+        return None
+    process = _OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if _is_invalid_handle(process):
+        return None
+    token = wintypes.HANDLE()
+    try:
+        if not _OpenProcessToken(process, TOKEN_QUERY, ctypes.byref(token)):
+            return None
+        return _token_user_sid(token)
+    finally:
+        if token.value:
+            _CloseHandle(token)
+        _CloseHandle(process)
+
+
+def _client_user_sid(pipe_handle) -> str | None:
+    """管道调用方（客户端进程）的用户 SID；拿不到返回 None（调用方按未授权处理）。"""
+    client_pid = wintypes.DWORD(0)
+    if not _GetNamedPipeClientProcessId(pipe_handle, ctypes.byref(client_pid)):
+        return None
+    return _process_user_sid(int(client_pid.value))
+
+
+def _sid_equal(left: str | None, right: str | None) -> bool:
+    """比较两个 SID 字符串（None 一律视为不相等）。"""
+    if not left or not right:
+        return False
+    return left.strip().upper() == right.strip().upper()
+
+
+# ---------------------------------------------------------------------------
 # 服务端
 # ---------------------------------------------------------------------------
 
@@ -256,15 +465,24 @@ class PipeServer:
     Args:
         pipe_name: 管道全名，默认 protocol.PIPE_NAME。
         token: hello 首帧必须携带的 token（由 paths.ensure_token() 提供）。
+        validate_sid: 是否校验管道调用方 SID（默认 True，M1b 安全项）。
+            测试可显式传 False 来隔离验证其它行为。
     """
 
-    def __init__(self, pipe_name: str = protocol.PIPE_NAME, token: str | None = None):
+    def __init__(
+        self,
+        pipe_name: str = protocol.PIPE_NAME,
+        token: str | None = None,
+        validate_sid: bool = True,
+    ):
         if not isinstance(pipe_name, str) or not pipe_name:
             raise ValueError("pipe_name 不能为空")
         if not isinstance(token, str) or not token:
             raise ValueError("token 不能为空")
         self.pipe_name = pipe_name
         self.token = token
+        self.validate_sid = bool(validate_sid)
+        self._current_sid: str | None = None  # 懒加载；进程生命周期内不变
         self._stop_event = threading.Event()
         self._serving = threading.Event()
         # 先在构造时就把第一个管道实例建出来：这样 agent 打印"已启动"之前，
@@ -389,6 +607,10 @@ class PipeServer:
         buffer = bytearray()
         disconnect_reason = "client_closed"
         try:
+            # M1b：先确认调用方与 agent 同用户，再读首帧 hello。
+            if not self._check_client_sid(handle):
+                disconnect_reason = "unauthorized"
+                return
             if not self._authenticate(handle, buffer):
                 disconnect_reason = "hello_rejected"
                 return
@@ -461,10 +683,69 @@ class PipeServer:
                 pipe=self.pipe_name,
             )
 
+    def _check_client_sid(self, handle) -> bool:
+        """M1b：确认管道调用方与 agent 是同一个用户。
+
+        取不到调用方 SID（OpenProcess/令牌被拒等）也按不通过处理（fail closed），
+        回 ``unauthorized`` 后断开，并记 ``unauthorized`` 日志。
+        """
+        if not self.validate_sid:
+            return True
+
+        if self._current_sid is None:
+            self._current_sid = _current_user_sid()
+        if not self._current_sid:
+            log.log_event(
+                "unauthorized",
+                level="warning",
+                reason="current_sid_unavailable",
+                pipe=self.pipe_name,
+            )
+            self._reject_unauthorized(handle)
+            return False
+
+        client_sid = _client_user_sid(handle)
+        if not _sid_equal(client_sid, self._current_sid):
+            log.log_event(
+                "unauthorized",
+                level="warning",
+                reason="sid_mismatch",
+                client_sid=client_sid,
+                agent_sid=self._current_sid,
+                pipe=self.pipe_name,
+            )
+            self._reject_unauthorized(handle)
+            return False
+        return True
+
+    def _reject_unauthorized(self, handle) -> None:
+        try:
+            _send_frame(
+                handle,
+                protocol.make_error(
+                    None, protocol.CODE_UNAUTHORIZED, "调用方不是当前用户，拒绝服务"
+                ),
+                flush=True,
+            )
+        except _ConnectionClosed:
+            pass
+
     def _authenticate(self, handle, buffer: bytearray) -> bool:
         """校验首帧 hello。失败时已回错误帧，返回 False。"""
         try:
-            line = _read_line(handle, buffer)
+            line = _read_line_with_timeout(handle, buffer, protocol.HELLO_TIMEOUT_MS)
+        except _HelloTimeout:
+            log.log_event(
+                "hello_timeout",
+                level="warning",
+                timeout_ms=protocol.HELLO_TIMEOUT_MS,
+                pipe=self.pipe_name,
+            )
+            try:
+                self._reject(handle, None, protocol.CODE_BAD_TOKEN, "首帧 hello 超时")
+            except _ConnectionClosed:
+                pass
+            return False
         except _LineTooLarge:
             log.log_event("hello_rejected", reason="first_frame_too_large", pipe=self.pipe_name)
             try:

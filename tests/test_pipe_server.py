@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import ctypes
 import faulthandler
+import inspect
 import io
 import json
 import msvcrt
@@ -47,7 +48,14 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from fireloop import APP_NAME, __version__, agent as agent_entry, paths, protocol  # noqa: E402
+from fireloop import (  # noqa: E402
+    APP_NAME,
+    __version__,
+    agent as agent_entry,
+    paths,
+    pipe_server as pipe_server_module,
+    protocol,
+)
 from fireloop.pipe_server import PipeServer  # noqa: E402
 from fireloop.single_instance import DEFAULT_MUTEX_NAME, SingleInstance  # noqa: E402
 
@@ -155,6 +163,19 @@ class _PipeClient:
             self._pipe.close()
         except OSError:
             pass
+
+
+def _connect_pipe(pipe_name: str, timeout: float = 5.0) -> _PipeClient:
+    """连管道（带重试和超时）；管道实例被占/尚未建好时等它一下。"""
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            return _PipeClient(pipe_name)
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.01)
+    raise AssertionError(f"{timeout}s 内连不上管道 {pipe_name}: {last_error}")
 
 
 class _HardTimeoutMixin:
@@ -520,6 +541,49 @@ class PipeServerTest(_TempHomeMixin, _HardTimeoutMixin, unittest.TestCase):
             too_large.wait_eof()
         self.assert_server_serves_new_connection()
 
+    # ---------- M1b：SID 校验 + hello 超时 ----------
+
+    def test_hello_timeout_rejects_within_2s_and_server_survives(self) -> None:
+        client = self.connect()  # 连上但故意不发 hello
+        started = time.monotonic()
+        reply = client.recv_msg(timeout=6.0)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(reply["type"], protocol.RESULT)
+        self.assertFalse(reply["ok"])
+        self.assertIn(reply["code"], (protocol.CODE_BAD_TOKEN, protocol.CODE_TIMEOUT))
+        self.assertGreaterEqual(elapsed, 1.0, "首帧超时不该立刻回错误")
+        self.assertLessEqual(elapsed, 5.0, f"首帧超时太慢（{elapsed:.2f}s），可能没走 Peek 轮询")
+        client.wait_eof()
+        self.assert_server_serves_new_connection()
+
+        records = self.read_log_records()
+        self.assertTrue(
+            any(r.get("event") == "hello_timeout" for r in records),
+            f"缺少 hello_timeout 日志: {records}",
+        )
+
+    def test_sid_mismatch_returns_unauthorized(self) -> None:
+        forged_sid = "S-1-5-21-1111111111-2222222222-3333333333-9999"
+        with mock.patch.object(
+            pipe_server_module, "_client_user_sid", return_value=forged_sid
+        ):
+            client = self.connect()
+            reply = client.recv_msg()
+
+        self.assertEqual(reply["type"], protocol.RESULT)
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["code"], protocol.CODE_UNAUTHORIZED)
+        client.wait_eof()
+
+        # mock 撤销后，同用户的新连接必须继续正常服务（服务端不能崩/不能卡）。
+        self.assert_server_serves_new_connection()
+        records = self.read_log_records()
+        self.assertTrue(
+            any(r.get("event") == "unauthorized" for r in records),
+            f"缺少 unauthorized 日志: {records}",
+        )
+
     # ---------- 日志纪律 ----------
 
     def test_logs_contain_only_fingerprint_not_task_text(self) -> None:
@@ -704,7 +768,13 @@ def _ping_via_pipe(pipe_name: str, token: str, req_id: str, timeout: float = 5.0
 
 
 class AgentArgsTest(_TempHomeMixin, _HardTimeoutMixin, unittest.TestCase):
-    """agent 入口参数映射单测：进程内 mock，不占真实互斥体、不起真进程。"""
+    """agent 入口参数映射单测：进程内 mock，不占真实互斥体、不起真进程、不碰事件子系统。
+
+    注意：这里除了 SingleInstance/PipeServer/控制台处理器，还显式 mock 掉
+    load_config / start_event_watchers / stop_event_watchers。否则 main() 会读真实
+    config.json——一旦用户把 events.enabled 打开，测试进程里会真起 watcher 线程、
+    甚至碰真实剪贴板/桌面，测试不可复现。参数映射单测不应该依赖事件配置。
+    """
 
     def setUp(self) -> None:
         self._start_watchdog()
@@ -750,9 +820,19 @@ class AgentArgsTest(_TempHomeMixin, _HardTimeoutMixin, unittest.TestCase):
             mock.patch.object(agent_entry, "SingleInstance", FakeSingleInstance),
             mock.patch.object(agent_entry, "PipeServer", FakePipeServer),
             mock.patch.object(agent_entry, "_install_console_handler", return_value=False),
+            # 事件子系统全部钉死：单测只验证参数映射，绝不真读用户配置/真起 watcher。
+            # 这样即使用户真实 config.json 把 events.enabled 打开，测试进程也不会起
+            # 文件/剪贴板/前台监听线程，更不会碰真实桌面。
+            mock.patch.object(agent_entry, "load_config", return_value={}) as fake_load_config,
+            mock.patch.object(
+                agent_entry, "start_event_watchers", return_value=(None, [])
+            ) as fake_start_events,
+            mock.patch.object(agent_entry, "stop_event_watchers", return_value=None),
             redirect_stdout(output),
         ):
             rc = agent_entry.main(argv)
+        recorded["load_config_called"] = fake_load_config.called
+        recorded["start_event_watchers_called"] = fake_start_events.called
         return rc, recorded, output.getvalue()
 
     def test_default_mutex_name_used_when_flag_omitted(self) -> None:
@@ -764,6 +844,9 @@ class AgentArgsTest(_TempHomeMixin, _HardTimeoutMixin, unittest.TestCase):
         self.assertTrue(recorded["served"])
         self.assertTrue(recorded["released"])
         self.assertIn("Fire Loop agent 已启动", output)
+        # main 的事件启动路径必须走 mock，绝不在测试进程里创建真实 watcher。
+        self.assertTrue(recorded["load_config_called"])
+        self.assertTrue(recorded["start_event_watchers_called"])
 
     def test_custom_mutex_name_passed_to_single_instance(self) -> None:
         pipe_name = _unique_pipe_name()
@@ -866,6 +949,92 @@ class AgentSubprocessTest(_TempHomeMixin, _HardTimeoutMixin, unittest.TestCase):
         _ping_via_pipe(pipe_b, token, "mutex-b")
         self.assertIsNone(agent_a.proc.poll())
         self.assertIsNone(agent_b.proc.poll())
+
+
+class SidHelpersTest(_TempHomeMixin, _HardTimeoutMixin, unittest.TestCase):
+    """SID 工具函数单测：真实调 Win32，不 mock。"""
+
+    def setUp(self) -> None:
+        self._start_watchdog()
+        self._setup_temp_home()
+
+    def tearDown(self) -> None:
+        try:
+            self._teardown_temp_home()
+        finally:
+            self._stop_watchdog()
+
+    def test_current_user_sid_looks_like_sid(self) -> None:
+        sid = pipe_server_module._current_user_sid()
+        self.assertIsInstance(sid, str, "拿不到当前进程用户 SID")
+        self.assertTrue(sid.startswith("S-1-"), f"SID 格式不对: {sid!r}")
+
+    def test_sid_equal_current_is_true(self) -> None:
+        current = pipe_server_module._current_user_sid()
+        self.assertTrue(pipe_server_module._sid_equal(current, current))
+
+    def test_sid_equal_forged_is_false(self) -> None:
+        current = pipe_server_module._current_user_sid()
+        forged = "S-1-5-21-1111111111-2222222222-3333333333-9999"
+        self.assertFalse(pipe_server_module._sid_equal(current, forged))
+        self.assertFalse(pipe_server_module._sid_equal(None, current))
+        self.assertFalse(pipe_server_module._sid_equal(current, ""))
+
+    def test_process_user_sid_matches_current(self) -> None:
+        self.assertEqual(
+            pipe_server_module._process_user_sid(os.getpid()),
+            pipe_server_module._current_user_sid(),
+        )
+
+    def test_validate_sid_default_on(self) -> None:
+        default = inspect.signature(PipeServer).parameters["validate_sid"].default
+        self.assertIs(default, True, "SID 校验必须默认开启")
+
+
+class PipeServerNoSidValidationTest(_TempHomeMixin, _HardTimeoutMixin, unittest.TestCase):
+    """validate_sid=False 时跳过 SID 校验（测试隔离用），其它鉴权照旧。"""
+
+    def setUp(self) -> None:
+        self._start_watchdog()
+        self._setup_temp_home()
+        self.token = paths.ensure_token()
+        self.pipe_name = _unique_pipe_name()
+        self._clients: list[_PipeClient] = []
+        self.server = PipeServer(
+            pipe_name=self.pipe_name, token=self.token, validate_sid=False
+        )
+        self._thread = threading.Thread(
+            target=self.server.serve_forever,
+            name="fireloop-pipe-server-no-sid",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def tearDown(self) -> None:
+        try:
+            for client in self._clients:
+                client.close()
+            self.server.stop()
+            self._thread.join(timeout=5)
+            self.assertFalse(self._thread.is_alive(), "serve_forever 线程没有退出（线程泄漏）")
+            self._teardown_temp_home()
+        finally:
+            self._stop_watchdog()
+
+    def test_validate_sid_false_skips_sid_mismatch(self) -> None:
+        forged_sid = "S-1-5-21-1111111111-2222222222-3333333333-9999"
+        with mock.patch.object(
+            pipe_server_module, "_client_user_sid", return_value=forged_sid
+        ):
+            client = _connect_pipe(self.pipe_name)
+            self._clients.append(client)
+            client.send_msg(protocol.make_hello(self.token))
+            hello = client.recv_msg()
+            self.assertEqual(hello["type"], protocol.HELLO_OK)
+            client.send_msg(protocol.make_ping("no-sid"))
+            reply = client.recv_msg()
+            self.assertTrue(reply["ok"])
+            self.assertEqual(reply["text"], "pong")
 
 
 if __name__ == "__main__":

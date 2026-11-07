@@ -6,7 +6,10 @@
 2. ``paths.ensure_token()`` 读/生成 token；
 3. ``SingleInstance`` 抢互斥体 ``Local\\FireLoopAgent``（可用 ``--mutex-name`` 覆盖，
    验收/测试环境借此与真实常驻 agent 完全隔离），抢不到说明已有实例，退出码 1；
-4. 起 ``PipeServer`` 无限 accept。
+4. 起 ``PipeServer`` 无限 accept；
+5. 读 ``config.json``（``paths.config_path()``），``events.enabled = true`` 时
+   按 file/clipboard/foreground 各自开关启动事件 watcher —— **默认全关**，
+   所以 M1a 行为完全不变；退出时在 ``finally`` 里把所有 watcher stop 掉。
 
 Ctrl+C：Windows 控制台里主线程正阻塞在 ``ConnectNamedPipe``，Python 的
 KeyboardInterrupt 打不断 C 调用，所以额外用 ``SetConsoleCtrlHandler`` 注册
@@ -23,6 +26,10 @@ import threading
 from ctypes import wintypes
 
 from . import log, paths, protocol
+from .clipboard_watcher import ClipboardWatcher
+from .events import EventBus, enabled_watchers, load_config
+from .file_watcher import FileWatcher
+from .foreground_watcher import ForegroundWatcher
 from .pipe_server import PipeServer
 from .single_instance import DEFAULT_MUTEX_NAME, SingleInstance
 
@@ -88,6 +95,82 @@ def _install_console_handler(server: PipeServer) -> bool:
     return False
 
 
+def build_event_watchers(config: dict, bus: EventBus) -> list:
+    """按配置构造事件 watcher（只构造，不 start；便于测试/联调单独验证 gating）。"""
+    flags = enabled_watchers(config)
+    events_cfg = config.get("events", {}) if isinstance(config, dict) else {}
+    watchers: list = []
+    if flags["file"]:
+        file_cfg = events_cfg.get("file", {})
+        watch_dirs = file_cfg.get("watch_dirs", []) if isinstance(file_cfg, dict) else []
+        watchers.append(FileWatcher(watch_dirs, bus))
+    if flags["clipboard"]:
+        watchers.append(ClipboardWatcher(bus))
+    if flags["foreground"]:
+        watchers.append(ForegroundWatcher(bus))
+    return watchers
+
+
+def start_event_watchers(
+    config: dict | None = None,
+) -> tuple[EventBus | None, list]:
+    """按配置启动事件 watcher，返回 ``(bus, watchers)``。
+
+    默认配置（``events.enabled = false``）直接返回 ``(None, [])``：不建总线、
+    不起线程，保证 M1a 行为完全不变。单个 watcher 启动失败只记日志，不拖垮 agent。
+    """
+    if config is None:
+        config = load_config()
+    flags = enabled_watchers(config)
+    if not any(flags.values()):
+        return None, []
+
+    bus = EventBus.from_config(config)
+    watchers = build_event_watchers(config, bus)
+    started: list = []
+    for watcher in watchers:
+        try:
+            watcher.start()
+        except Exception as exc:
+            log.log_event(
+                "watcher_error",
+                level="warning",
+                watcher=type(watcher).__name__,
+                stage="start",
+                error=repr(exc),
+            )
+            continue
+        started.append(watcher)
+
+    if started:
+        log.log_event(
+            "events_started",
+            watchers=[type(watcher).__name__ for watcher in started],
+            quota_per_hour=bus.quota_per_hour,
+            debounce_ms=bus.debounce_ms,
+            dedupe_window_s=bus.dedupe_window_s,
+        )
+    return bus, started
+
+
+def stop_event_watchers(watchers: list) -> None:
+    """停止所有事件 watcher；单个 watcher 报错不影响其它 watcher 和 agent 退出。"""
+    if not watchers:
+        return
+    for watcher in watchers:
+        try:
+            watcher.stop()
+        except Exception as exc:
+            log.log_event(
+                "watcher_error",
+                level="warning",
+                watcher=type(watcher).__name__,
+                stage="stop",
+                error=repr(exc),
+            )
+    log.log_event("events_stopped", count=len(watchers))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -103,10 +186,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     server = None
+    watchers: list = []  # 事件 watcher；默认配置（events.enabled=false）保持为空
     try:
+        # 事件配置：文件不存在/坏 JSON 都会安全回落到"全关"的默认配置。
+        config = load_config()
         server = PipeServer(pipe_name=args.pipe_name, token=token)
         try:
             _install_console_handler(server)
+            # 默认配置下这里返回 (None, [])，不创建任何监听线程，M1a 行为不变。
+            _event_bus, watchers = start_event_watchers(config)
             print(f"Fire Loop agent 已启动，管道 {args.pipe_name}", flush=True)
             server.serve_forever()
         except KeyboardInterrupt:
@@ -114,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
             server.stop()
             log.log_event("agent_stop_requested", reason="keyboard_interrupt")
     finally:
+        stop_event_watchers(watchers)
         instance.release()
 
     print("Fire Loop agent 已退出", flush=True)
