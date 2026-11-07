@@ -4,7 +4,8 @@
 
 1. ``paths.ensure_dirs()`` 建数据目录；
 2. ``paths.ensure_token()`` 读/生成 token；
-3. ``SingleInstance`` 抢 ``Local\\FireLoopAgent`` 互斥体，抢不到说明已有实例，退出码 1；
+3. ``SingleInstance`` 抢互斥体 ``Local\\FireLoopAgent``（可用 ``--mutex-name`` 覆盖，
+   验收/测试环境借此与真实常驻 agent 完全隔离），抢不到说明已有实例，退出码 1；
 4. 起 ``PipeServer`` 无限 accept。
 
 Ctrl+C：Windows 控制台里主线程正阻塞在 ``ConnectNamedPipe``，Python 的
@@ -23,7 +24,7 @@ from ctypes import wintypes
 
 from . import log, paths, protocol
 from .pipe_server import PipeServer
-from .single_instance import SingleInstance
+from .single_instance import DEFAULT_MUTEX_NAME, SingleInstance
 
 _CTRL_C_EVENT = 0
 _CTRL_BREAK_EVENT = 1
@@ -48,6 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--pipe-name",
         default=protocol.PIPE_NAME,
         help=f"命名管道全名，默认 {protocol.PIPE_NAME}",
+    )
+    parser.add_argument(
+        "--mutex-name",
+        default=None,
+        help=(
+            "单实例互斥体名，默认 "
+            f"{DEFAULT_MUTEX_NAME}；验收/测试时传唯一名字即可与真实常驻 agent 隔离"
+        ),
     )
     return parser
 
@@ -85,7 +94,10 @@ def main(argv: list[str] | None = None) -> int:
     paths.ensure_dirs()
     token = paths.ensure_token()
 
-    instance = SingleInstance()
+    # None（没传 --mutex-name）时保持原来的默认行为，完全不受影响。
+    mutex_name = args.mutex_name or DEFAULT_MUTEX_NAME
+
+    instance = SingleInstance(mutex_name)
     if not instance.acquire():
         print("Fire Loop agent 已经在运行", flush=True)
         return 1

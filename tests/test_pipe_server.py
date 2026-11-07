@@ -11,7 +11,9 @@
 - 管道名 / 互斥体名都带 pid + 随机串，避免和 worker-cli 并行测试、真实 agent 冲突；
 - 测试客户端直接用内置 open(pipe_name, "r+b", buffering=0) 读写管道，不依赖 T2 的
   client.py（测试 T1 时它可能还没写完）；
-- 每个用例有硬超时看门狗：真挂死就 dump 线程栈并 os._exit(99)，绝不让命令行挂住。
+- 每个用例有硬超时看门狗：真挂死就 dump 线程栈并 os._exit(99)，绝不让命令行挂住；
+- agent 入口的 `--mutex-name` 隔离用 subprocess 起真实 agent 进程验证：
+  临时 FIRELOOP_HOME + 唯一 mutex/pipe 名，不碰真实常驻 agent 的 `Local\\FireLoopAgent`。
 
 关于客户端实现（踩过的坑，写清楚防止后来人再踩）：
 Windows 同步（非 OVERLAPPED）命名管道句柄上的 I/O 是按"文件对象"串行化的。
@@ -26,24 +28,32 @@ from __future__ import annotations
 
 import ctypes
 import faulthandler
+import io
 import json
 import msvcrt
 import os
 import queue
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
 import uuid
+from contextlib import redirect_stdout
 from ctypes import wintypes
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from fireloop import APP_NAME, __version__, paths, protocol  # noqa: E402
+from fireloop import APP_NAME, __version__, agent as agent_entry, paths, protocol  # noqa: E402
 from fireloop.pipe_server import PipeServer  # noqa: E402
-from fireloop.single_instance import SingleInstance  # noqa: E402
+from fireloop.single_instance import DEFAULT_MUTEX_NAME, SingleInstance  # noqa: E402
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC_DIR = _REPO_ROOT / "src"
+_AGENT_STARTUP_PREFIX = "Fire Loop agent 已启动，管道 "
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _PeekNamedPipe = _kernel32.PeekNamedPipe
@@ -556,6 +566,306 @@ class PipeServerTest(_TempHomeMixin, _HardTimeoutMixin, unittest.TestCase):
             f"没有找到 bad_json 的 error 日志: {records}",
         )
         self.assertTrue(any(r.get("event") == "client_disconnected" for r in records))
+
+
+# ---------------------------------------------------------------------------
+# agent 入口 --mutex-name（T3a：验收环境与真实常驻 agent 隔离）
+# ---------------------------------------------------------------------------
+
+
+def _agent_env() -> dict:
+    """跑真实 agent 子进程用：继承当前 FIRELOOP_HOME（临时目录），保证能 import fireloop。"""
+    env = dict(os.environ)
+    pythonpath = str(_SRC_DIR)
+    old = env.get("PYTHONPATH", "")
+    if old:
+        pythonpath = pythonpath + os.pathsep + old
+    env["PYTHONPATH"] = pythonpath
+    return env
+
+
+def _agent_argv(pipe_name: str, mutex_name: str | None = None) -> list[str]:
+    argv = [sys.executable, "-m", "fireloop.agent", "--pipe-name", pipe_name]
+    if mutex_name is not None:
+        argv.extend(["--mutex-name", mutex_name])
+    return argv
+
+
+class _AgentProcess:
+    """subprocess 起的真实 agent 进程 + 输出行队列（断言全部带超时）。"""
+
+    def __init__(self, pipe_name: str, mutex_name: str | None = None):
+        self.pipe_name = pipe_name
+        self.proc = subprocess.Popen(
+            _agent_argv(pipe_name, mutex_name),
+            cwd=str(_REPO_ROOT),
+            env=_agent_env(),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self.lines: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._pump, name="agent-subprocess-stdout", daemon=True
+        )
+        self._thread.start()
+
+    def _pump(self) -> None:
+        try:
+            for line in iter(self.proc.stdout.readline, ""):
+                self.lines.put(line.rstrip("\n"))
+        except Exception:
+            pass
+        finally:
+            self.lines.put(None)
+
+    def drain(self, timeout: float = 1.0) -> list[str]:
+        got: list[str] = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                item = self.lines.get(timeout=0.05)
+            except queue.Empty:
+                if self.proc.poll() is not None:
+                    break
+                continue
+            if item is None:
+                break
+            got.append(item)
+        return got
+
+    def wait_startup(self, timeout: float = 10.0) -> str:
+        expected = f"{_AGENT_STARTUP_PREFIX}{self.pipe_name}"
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.proc.poll() is not None:
+                raise AssertionError(
+                    f"agent 启动失败，退出码 {self.proc.returncode}，输出: {self.drain()}"
+                )
+            try:
+                item = self.lines.get(timeout=0.05)
+            except queue.Empty:
+                if time.monotonic() >= deadline:
+                    raise AssertionError(f"{timeout}s 内等不到启动行，输出: {self.drain()}")
+                continue
+            if item is None:
+                raise AssertionError(f"agent 输出流提前结束，退出码 {self.proc.returncode}")
+            if item == expected:
+                return item
+
+    def stop(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        try:
+            self.proc.stdout.close()
+        except Exception:
+            pass
+        self._thread.join(timeout=2)
+
+
+def _ping_via_pipe(pipe_name: str, token: str, req_id: str, timeout: float = 5.0) -> dict:
+    """连一次真实 agent：hello 鉴权 + ping，断言 pong。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            client = _PipeClient(pipe_name)
+            break
+        except OSError as exc:
+            # 管道实例可能正被占着（ERROR_PIPE_BUSY → open() 映射成 EINVAL），等它空出来
+            busy = exc.winerror == 231 or exc.errno == 22
+            if not busy:
+                raise AssertionError(f"连不上 agent 管道（winerror={exc.winerror}）: {exc}") from exc
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"{timeout}s 内连不上 agent 管道") from exc
+            time.sleep(0.01)
+    try:
+        client.send_msg(protocol.make_hello(token))
+        hello = client.recv_msg()
+        if hello.get("type") != protocol.HELLO_OK:
+            raise AssertionError(f"hello 鉴权失败: {hello}")
+        client.send_msg(protocol.make_ping(req_id))
+        reply = client.recv_msg()
+        if not (
+            reply.get("ok") is True
+            and reply.get("id") == req_id
+            and reply.get("text") == "pong"
+        ):
+            raise AssertionError(f"ping 响应不对: {reply}")
+        return reply
+    finally:
+        client.close()
+
+
+class AgentArgsTest(_TempHomeMixin, _HardTimeoutMixin, unittest.TestCase):
+    """agent 入口参数映射单测：进程内 mock，不占真实互斥体、不起真进程。"""
+
+    def setUp(self) -> None:
+        self._start_watchdog()
+        self._setup_temp_home()
+
+    def tearDown(self) -> None:
+        try:
+            self._teardown_temp_home()
+        finally:
+            self._stop_watchdog()
+
+    def test_parser_defaults_unchanged(self) -> None:
+        args = agent_entry.build_parser().parse_args([])
+        self.assertEqual(args.pipe_name, protocol.PIPE_NAME)
+        self.assertIsNone(args.mutex_name)
+
+    def _run_main_with_fakes(self, argv: list[str]):
+        recorded: dict = {}
+
+        class FakePipeServer:
+            def __init__(self, pipe_name: str = protocol.PIPE_NAME, token: str | None = None):
+                recorded["pipe_name"] = pipe_name
+                recorded["token"] = token
+
+            def serve_forever(self) -> None:
+                recorded["served"] = True
+
+            def stop(self) -> None:
+                pass
+
+        class FakeSingleInstance:
+            def __init__(self, name: str = DEFAULT_MUTEX_NAME):
+                recorded["mutex_name"] = name
+
+            def acquire(self) -> bool:
+                return True
+
+            def release(self) -> None:
+                recorded["released"] = True
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(agent_entry, "SingleInstance", FakeSingleInstance),
+            mock.patch.object(agent_entry, "PipeServer", FakePipeServer),
+            mock.patch.object(agent_entry, "_install_console_handler", return_value=False),
+            redirect_stdout(output),
+        ):
+            rc = agent_entry.main(argv)
+        return rc, recorded, output.getvalue()
+
+    def test_default_mutex_name_used_when_flag_omitted(self) -> None:
+        pipe_name = _unique_pipe_name()
+        rc, recorded, output = self._run_main_with_fakes(["--pipe-name", pipe_name])
+        self.assertEqual(rc, 0)
+        self.assertEqual(recorded["mutex_name"], DEFAULT_MUTEX_NAME)
+        self.assertEqual(recorded["pipe_name"], pipe_name)
+        self.assertTrue(recorded["served"])
+        self.assertTrue(recorded["released"])
+        self.assertIn("Fire Loop agent 已启动", output)
+
+    def test_custom_mutex_name_passed_to_single_instance(self) -> None:
+        pipe_name = _unique_pipe_name()
+        mutex_name = _unique_mutex_name()
+        rc, recorded, _ = self._run_main_with_fakes(
+            ["--pipe-name", pipe_name, "--mutex-name", mutex_name]
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(recorded["mutex_name"], mutex_name)
+        self.assertEqual(recorded["pipe_name"], pipe_name)
+
+    def test_busy_mutex_exits_1(self) -> None:
+        recorded: dict = {}
+
+        class BusySingleInstance:
+            def __init__(self, name: str = DEFAULT_MUTEX_NAME):
+                recorded["mutex_name"] = name
+
+            def acquire(self) -> bool:
+                return False
+
+            def release(self) -> None:
+                recorded["released"] = True
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(agent_entry, "SingleInstance", BusySingleInstance),
+            redirect_stdout(output),
+        ):
+            rc = agent_entry.main(["--pipe-name", _unique_pipe_name()])
+        self.assertEqual(rc, 1)
+        self.assertIn("Fire Loop agent 已经在运行", output.getvalue())
+        # 没传 --mutex-name 时，抢锁失败路径同样用默认互斥体名
+        self.assertEqual(recorded["mutex_name"], DEFAULT_MUTEX_NAME)
+
+
+class AgentSubprocessTest(_TempHomeMixin, _HardTimeoutMixin, unittest.TestCase):
+    """真起 agent 进程验证 --mutex-name 隔离：唯一 mutex/pipe 名 + 临时 FIRELOOP_HOME。"""
+
+    def setUp(self) -> None:
+        self._start_watchdog()
+        self._setup_temp_home()
+        self.assertEqual(paths.home(), Path(os.environ["FIRELOOP_HOME"]))
+        self._agents: list[_AgentProcess] = []
+
+    def tearDown(self) -> None:
+        try:
+            for agent in self._agents:
+                agent.stop()
+            self._teardown_temp_home()
+        finally:
+            self._stop_watchdog()
+
+    def _start_agent(self, pipe_name: str, mutex_name: str) -> _AgentProcess:
+        agent = _AgentProcess(pipe_name, mutex_name)
+        self._agents.append(agent)
+        agent.wait_startup()
+        return agent
+
+    def _read_token(self) -> str:
+        token = (Path(os.environ["FIRELOOP_HOME"]) / "agent.token").read_text(
+            encoding="utf-8"
+        ).strip()
+        self.assertGreater(len(token), 0)
+        return token
+
+    def test_second_agent_with_same_mutex_exits_1(self) -> None:
+        mutex_name = _unique_mutex_name()
+        first = self._start_agent(_unique_pipe_name(), mutex_name)
+
+        second = subprocess.run(
+            _agent_argv(_unique_pipe_name(), mutex_name),
+            cwd=str(_REPO_ROOT),
+            env=_agent_env(),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        self.assertEqual(
+            second.returncode,
+            1,
+            f"同 mutex 名的第二个 agent 应退出码 1，实际 {second.returncode}；"
+            f"stdout={second.stdout!r} stderr={second.stderr!r}",
+        )
+        self.assertIn("Fire Loop agent 已经在运行", second.stdout)
+        self.assertIsNone(first.proc.poll(), "第二个实例被挡住后，第一个 agent 必须还活着")
+
+    def test_different_mutex_names_can_both_start_and_serve(self) -> None:
+        pipe_a = _unique_pipe_name()
+        pipe_b = _unique_pipe_name()
+        agent_a = self._start_agent(pipe_a, _unique_mutex_name())
+        agent_b = self._start_agent(pipe_b, _unique_mutex_name())  # 不同 mutex，不该被挡
+        self.assertIsNone(agent_a.proc.poll())
+        self.assertIsNone(agent_b.proc.poll(), "不同 mutex 名的第二个 agent 不应该退出")
+
+        token = self._read_token()
+        _ping_via_pipe(pipe_a, token, "mutex-a")
+        _ping_via_pipe(pipe_b, token, "mutex-b")
+        self.assertIsNone(agent_a.proc.poll())
+        self.assertIsNone(agent_b.proc.poll())
 
 
 if __name__ == "__main__":

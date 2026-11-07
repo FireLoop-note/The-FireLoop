@@ -29,6 +29,15 @@ python -m fireloop.cli task "测试"
 python -m unittest discover -s tests -v
 ```
 
+## 验收（随时可跑，不影响正在运行的 agent）
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python tests\acceptance\run_m1a_acceptance.py
+```
+
+每次运行自动生成隔离管道、隔离互斥体和临时数据目录，真实 agent 正在跑也不冲突、不会被杀掉；输出 20 项 PASS/FAIL，`--json` 可拿机器可读结果。详见 [验收文档](docs/验收.md)。
+
 环境：Windows 11，Python 3.15.1（`D:\Python\python.exe`），M1a 零第三方依赖。
 
 ## 目录
