@@ -1,4 +1,17 @@
-# AGENTS.md · 小鲸鱼植入式项目
+# AGENTS.md · Fire Loop（火环）植入式项目
+
+## 项目定位
+
+- 个人自用项目，**不考虑对外发布**：不做安装包、代码签名、自动更新、多用户分发。
+- 唯一权威文档是 `docs/fire-loop-方案.md`，架构和命名以它为准，不在代码里另起炉灶。
+- 技术路线已拍板：ctypes 直调 Win32 命名管道 + JSON Lines、标准库 unittest、M1a 零第三方依赖。
+- 旧项目（小鲸鱼）与本项目无关，不引用、不复制。
+
+## 团队与分工
+
+- 本项目由 Lead 统一调度，子会话 agent 按模块开发；公共底座（paths/log/protocol/文档/提交）由 Lead 独占。
+- Lead 职责和子 agent 硬规则见 `docs/fire-loop-方案.md` 第 6 节，不重复写。
+- 子 agent 只改任务书里写明的文件；改完反馈 Lead，由 Lead 审 diff、跑验收、决定接受或打回。
 
 ## 回答方式
 
@@ -39,6 +52,7 @@
 ## Git
 
 - 一个里程碑一个提交，提交信息用中文。
+- 远程仓库：https://github.com/FireLoop-note/The-FireLoop.git，每个里程碑 push 一次。
 - 只提交自己改的文件，不用 git add -A。
 - 不执行 git reset --hard、git checkout -- .、git clean -fd、git stash 这些会覆盖别人工作的命令。
 - 不把运行时配置、日志、token、模型返回缓存提交进仓库。
